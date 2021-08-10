@@ -1,3 +1,6 @@
+
+#include <set>
+
 #include "addr2line.h"
 #include "asar.h"
 #include "libstr.h"
@@ -274,7 +277,10 @@ autoarray<string>* macrosublabels;
 // randomdude999: ns is still the string to prefix to all labels, it's calculated whenever namespace_list is changed
 string ns;
 autoarray<string> namespace_list;
-autoarray<string> prefix_list;
+
+/// Tracks top-level label names. Added for pool feature since
+/// this allows for multiple simultaneous top-level labelspaces.
+std::set<std::string> prefix_set;
 
 //bool fastrom=false;
 
@@ -381,22 +387,42 @@ static string labelname(const char ** rawname, bool define=false, string prefix 
 	}
 	else if (!in_struct && !in_sub_struct)
 	{
-		for (i=0;(*deref_rawname =='.');i++) deref_rawname++;
+		// If the label is a sublabel, this determines its level in the
+		// hierarchy.
+		for(i = 0; (*deref_rawname == '.'); i++)
+		{
+			deref_rawname++;
+		}
+		
 		if (!is_ualnum(*deref_rawname)) asar_throw_error(1, error_type_block, error_id_invalid_label_name);
 		if (emulatexkas && i>1) asar_throw_warning(1, warning_id_convert_to_asar);
+		
 		if (i)
 		{
-			if ((!sublabellist || !(*sublabellist)[i - 1]) && !prefix_list.count) asar_throw_error(1, error_type_block, error_id_label_missing_parent);
+			if 
+			(
+				(!sublabellist || !(*sublabellist)[i - 1])
+			)
+			{
+				asar_throw_error(1, error_type_block, error_id_label_missing_parent);
+			}
 			else if (prefix)
 			{
-				name+=prefix+"_";
-				if(sublabellist && (*sublabellist)[i - 1]){
-					name+=STR(*sublabellist)[i-1]+"_";  //this may be better off as an error
+				// Use the supplied prefix rather than the top-level label
+				// name.
+				name += prefix + "_";
+				
+				for(int j = 1; j < i; j += 1)
+				{
+					name += STR(*sublabellist)[j] + "_";
 				}
 			}
 			else
 			{
-				name+=STR(*sublabellist)[i-1]+"_";
+				for(int j = 0; j < i; j += 1)
+				{
+					name += STR(*sublabellist)[j] + "_";
+				}
 			}
 			issublabel = true;
 		}
@@ -423,7 +449,10 @@ static string labelname(const char ** rawname, bool define=false, string prefix 
 	}
 
 	if (!is_ualnum(*deref_rawname)) asar_throw_error(1, error_type_block, error_id_invalid_label_name);
-
+	
+	// The label name at the current hierarchical level.
+	string local_name = "";
+	
 	while (is_ualnum(*deref_rawname) || *deref_rawname == '.' || *deref_rawname == '[')
 	{
 		if(!in_struct && !in_sub_struct && *deref_rawname == '[')
@@ -446,13 +475,16 @@ static string labelname(const char ** rawname, bool define=false, string prefix 
 		{
 			asar_throw_error(1, error_type_block, error_id_array_invalid_inside_structs);
 		}
-
-		name+=*(deref_rawname++);
+		
+		local_name += *(deref_rawname++);
 	}
-	if (define && i>=0)
+	
+	name += local_name;
+	
+	if (define && i >= 0)
 	{
 		(*sublabellist).reset(i);
-		(*sublabellist)[i]=name;
+		(*sublabellist)[i] = local_name;
 	}
 	return name;
 #undef deref_rawname
@@ -531,9 +563,23 @@ static void setlabel(string name, int loc=-1)
 	{
 		if (labels.exists(name))
 		{
+			auto const & value = labels[name];
+			
+			if (value == loc)
+			{
+				// An attempt was made to re-emit a label name, but it is
+				// associated with the exact same memory location as
+				// previously recorded, so it should be harmless.
+				return;
+			}
+			
+			// On the other hand, if the same label were to be emitted twice but
+			// with differing addresses, that would be logically inconsistent
+			// and an error should be thrown.
 			movinglabelspossible=true;
 			asar_throw_error(0, error_type_block, error_id_label_redefined, name.data());
 		}
+		
 		labels.create(name) = (unsigned int)loc;
 	}
 	else if (pass==1)
@@ -663,7 +709,9 @@ void initstuff()
 	clidefines.each(adddefine);
 	ns="";
 	namespace_list.reset();
-	prefix_list.reset();
+	
+	prefix_set.clear();
+
 	sublabels.reset();
 	poslabels.reset();
 	neglabels.reset();
@@ -747,6 +795,17 @@ static bool addlabel(const char * label, int pos=-1, bool global_label = false)
 	if (!label[0] || label[0]==':') return false;//colons are reserved for special labels
 
 	const char* posneglabel = label;
+	
+	size_t const label_len = strlen(label);
+	
+	// Taking precautions in case the string length is zero.
+	char const last_label_char = label
+	[(
+		label_len > 0
+	  ? (label_len - 1)
+	  : 0
+	)];
+	
 	string posnegname = posneglabelname(&posneglabel, true);
 
 	if (posnegname.length() > 0)
@@ -756,46 +815,74 @@ static bool addlabel(const char * label, int pos=-1, bool global_label = false)
 		setlabel(posnegname, pos);
 		return true;
 	}
-	if (label[strlen(label)-1]==':' || label[0]=='.' || label[0]=='?' || label[0] == '#')
+	if (last_label_char == ':' || label[0]=='.' || label[0]=='?' || label[0] == '#')
 	{
 		if (!label[1]) return false;
 		if(global_label && (in_struct || in_sub_struct || label[0]=='?')) return false;
 
-		bool define = true;
+        // MathOnNapkins:
+        // Labels with a hash / pound symbol prefix don't alter the current
+        // labelspace hierarchy. That is, they don't 'define' a new node in the
+        // hierarchy.
+        bool const define = (label[0] != '#');
 
-		if (label[0] == '#')
+		if ( ! define )
 		{
-			define = false;
 			label++;
 		}
 
+        // MathOnNapkins:
+        // If we encounter a new top-level label, discard any pool prefixes
+        // currently in use. This prevents labelspace bleed in case the user
+        // forgets to manually invoke 'pool off'
+        if (define && last_label_char == ':' && label[0] != '.')
+        {
+            prefix_set.clear();
+        }
+        
 		// RPG Hacker: Also checking label[1] now, since it might be a macro sublabel.
 		// Also, apparently this here doesn't account for main labels. I guess because
 		// we don't even get here in the first place if they don't include a colon?
 		bool requirecolon = (label[0] != '.' && label[1] != '.') && (in_struct || in_sub_struct);
-		auto build_label_name = [&](string prefix){	//this is 100% a hack to experiment
-			string name=labelname(&label, define, prefix);
-			if (label[0]==':') label++;
+		
+		auto build_label_name = [&]
+		(
+			char const * p_label,
+			string       prefix = ""
+		)
+		{
+			// p4plus2: this is 100% a hack to experiment
+			// MathOnNapkins: Seems to work just fine as a lambda function.
+			// personally I would have gone with a subroutine.
+			
+			string name=labelname(&p_label, define, prefix);
+			
+			if (p_label[0]==':') p_label++;
 			else if (requirecolon) asar_throw_error(0, error_type_block, error_id_broken_label_definition);
 			else if (global_label) return false;
-			if (label[0]) asar_throw_error(0, error_type_block, error_id_broken_label_definition);
+			if (p_label[0]) asar_throw_error(0, error_type_block, error_id_broken_label_definition);
 			if (ns && !global_label) name=STR ns+name;
 			setlabel(name, pos);
 			return true;
 		};
-		for(int i = 0; i < prefix_list.count; i++)
+		
+		for (auto it = prefix_set.begin(); it != prefix_set.end(); it++)
 		{
-			const char *original_label = label;
-			if(!build_label_name(prefix_list[i]))
+			string const asar_s = (*it).c_str();
+			
+			bool const r = build_label_name(label, asar_s);
+			
+			if (r == false)
 			{
 				return false;
 			}
-			label = original_label;
 		}
-		if(!prefix_list.count)
+		
+		if (prefix_set.empty() )
 		{
-			return build_label_name("");
+			return build_label_name(label);
 		}
+		
 		return true;
 	}
 	return false;
@@ -1811,14 +1898,39 @@ void assembleblock(const char * block, bool isspecialline)
 	else if (is("pool"))
 	{
 		if(numwords == 1)  asar_throw_error(0, error_type_block, error_id_invalid_namespace_use); //temp error
+		
+		prefix_set.clear();
+		
+		sublabels.reset();
+		
 		if(numwords == 2 && !stricmp(par, "off"))
 		{
-			prefix_list.reset();
+			// MathOnNapkins: Nothing left to do. Note that this means that
+			// we can't have a pool labelspace named "off". My xkas pool
+			// design didn't need this keyword combination, and I think
+			// it may be superfluous in asar as well, since the next
+			// top level label creation will flush the prefix and sublabel
+			// set anyway. Leaving this intact for now.
 			return;
 		}
+		
 		for(int i = 1; i < numwords; i++)
 		{
-			prefix_list.append(word[i]);
+			std::string const s = word[i];
+			
+			if( prefix_set.count(s) == 0 )
+			{
+				prefix_set.insert(s);
+				
+				if(1 == i)
+				{
+					// MathOnNapkins: Only insert the first one. Not strictly necessary,
+					// we're merely adhering to a convention. The names in
+					// the prefix set will substitute for this part of the
+					// hierarchy where applicable.
+					sublabels.append(word[i]);
+				}
+			}
 		}
 	}
 	else if (is1("namespace") || is2("namespace"))
